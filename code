@@ -1,0 +1,161 @@
+-- =====================================================================
+-- TutorHub — complete Supabase schema (tables + RLS + storage)
+-- Run ONCE on a fresh project: Supabase Dashboard -> SQL Editor -> New query
+--
+-- >>> STEP 1: change the admin email below (line marked CHANGE ME) <<<
+-- =====================================================================
+
+-- ---------- Admin helper ----------
+create or replace function public.is_admin() returns boolean
+language sql stable as $$
+  select lower(coalesce(auth.jwt() ->> 'email', '')) = lower('admin@example.com')  -- CHANGE ME
+$$;
+
+-- ---------- Tables ----------
+create table public.profiles (
+  id          uuid primary key references auth.users(id) on delete cascade,
+  role        text not null default 'student' check (role in ('teacher','student')),
+  full_name   text not null default '',
+  avatar_url  text,
+  city        text,
+  bio         text,
+  whatsapp    text,
+  created_at  timestamptz not null default now()
+);
+
+create table public.gigs (
+  id               uuid primary key default gen_random_uuid(),
+  teacher_id       uuid not null references public.profiles(id) on delete cascade,
+  title            text not null check (char_length(title) between 5 and 120),
+  subject          text not null,
+  level            text not null check (level in ('Primary','Matric','FSc','O/A Level','Other')),
+  price_per_month  integer not null check (price_per_month > 0),
+  mode             text not null check (mode in ('online','home','both')),
+  description      text not null default '',
+  cover_url        text,
+  created_at       timestamptz not null default now()
+);
+create index gigs_filter_idx on public.gigs (subject, level, price_per_month);
+create index gigs_teacher_idx on public.gigs (teacher_id);
+
+create table public.requests (
+  id                uuid primary key default gen_random_uuid(),
+  gig_id            uuid not null references public.gigs(id) on delete cascade,
+  student_id        uuid not null references public.profiles(id) on delete cascade,
+  teacher_id        uuid not null references public.profiles(id) on delete cascade,
+  message           text not null check (char_length(message) between 5 and 1000),
+  preferred_timing  text not null default '',
+  status            text not null default 'pending' check (status in ('pending','accepted','rejected')),
+  created_at        timestamptz not null default now(),
+  unique (gig_id, student_id)               -- one request per student per gig (anti-spam)
+);
+create index requests_teacher_idx on public.requests (teacher_id);
+create index requests_student_idx on public.requests (student_id);
+
+-- ---------- Triggers ----------
+-- Create a profile row automatically on signup (role comes from signup metadata)
+create or replace function public.handle_new_user() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.profiles (id, role, full_name)
+  values (
+    new.id,
+    case when new.raw_user_meta_data ->> 'role' = 'teacher' then 'teacher' else 'student' end,
+    coalesce(new.raw_user_meta_data ->> 'full_name', '')
+  );
+  return new;
+end $$;
+create trigger on_auth_user_created after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- Users can't change their own role later
+create or replace function public.lock_role() returns trigger
+language plpgsql as $$
+begin
+  if new.role <> old.role and not public.is_admin() then new.role := old.role; end if;
+  return new;
+end $$;
+create trigger profiles_lock_role before update on public.profiles
+  for each row execute function public.lock_role();
+
+-- teacher_id on a request is always copied from the gig (can't be faked)
+create or replace function public.set_request_teacher() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  select teacher_id into new.teacher_id from public.gigs where id = new.gig_id;
+  return new;
+end $$;
+create trigger requests_set_teacher before insert on public.requests
+  for each row execute function public.set_request_teacher();
+
+-- ---------- Row Level Security ----------
+alter table public.profiles enable row level security;
+alter table public.gigs     enable row level security;
+alter table public.requests enable row level security;
+
+-- profiles: public read (needed to show teachers on gigs), edit own, admin edits any
+create policy "profiles read"   on public.profiles for select using (true);
+create policy "profiles update" on public.profiles for update
+  using (auth.uid() = id or public.is_admin()) with check (auth.uid() = id or public.is_admin());
+
+-- gigs: public read; only teachers create; owner or admin edit/delete
+create policy "gigs read" on public.gigs for select using (true);
+create policy "gigs insert" on public.gigs for insert to authenticated
+  with check (
+    auth.uid() = teacher_id
+    and exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'teacher')
+  );
+create policy "gigs update" on public.gigs for update to authenticated
+  using (auth.uid() = teacher_id or public.is_admin())
+  with check (auth.uid() = teacher_id or public.is_admin());
+create policy "gigs delete" on public.gigs for delete to authenticated
+  using (auth.uid() = teacher_id or public.is_admin());
+
+-- requests: only the student, the gig's teacher, or admin can see them
+create policy "requests read" on public.requests for select to authenticated
+  using (auth.uid() = student_id or auth.uid() = teacher_id or public.is_admin());
+create policy "requests insert" on public.requests for insert to authenticated
+  with check (
+    auth.uid() = student_id
+    and status = 'pending'
+    and exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'student')
+  );
+create policy "requests teacher update" on public.requests for update to authenticated
+  using (auth.uid() = teacher_id) with check (auth.uid() = teacher_id);
+create policy "requests delete" on public.requests for delete to authenticated
+  using (auth.uid() = student_id or public.is_admin());
+
+-- teachers may only change the status column of a request
+revoke update on public.requests from authenticated;
+grant update (status) on public.requests to authenticated;
+
+-- ---------- Admin RPCs (security definer, guarded by is_admin) ----------
+create or replace function public.admin_list_users()
+returns table (id uuid, email text, role text, full_name text, city text, created_at timestamptz)
+language sql security definer set search_path = public as $$
+  select p.id, u.email::text, p.role, p.full_name, p.city, p.created_at
+  from public.profiles p join auth.users u on u.id = p.id
+  where public.is_admin()
+  order by p.created_at desc
+$$;
+
+create or replace function public.admin_delete_user(uid uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_admin() then raise exception 'not allowed'; end if;
+  delete from auth.users where id = uid;   -- cascades to profile, gigs, requests
+end $$;
+
+-- ---------- Storage (public image buckets; users write only to their own folder) ----------
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true), ('covers', 'covers', true)
+on conflict (id) do nothing;
+
+create policy "images public read" on storage.objects for select
+  using (bucket_id in ('avatars','covers'));
+create policy "images own upload" on storage.objects for insert to authenticated
+  with check (bucket_id in ('avatars','covers') and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "images own update" on storage.objects for update to authenticated
+  using (bucket_id in ('avatars','covers') and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "images own delete" on storage.objects for delete to authenticated
+  using (bucket_id in ('avatars','covers') and (storage.foldername(name))[1] = auth.uid()::text);
